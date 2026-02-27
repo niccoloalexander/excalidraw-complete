@@ -6,6 +6,7 @@ import (
 	"excalidraw-complete/core"
 	"excalidraw-complete/handlers/api/documents"
 	"excalidraw-complete/handlers/api/firebase"
+	"excalidraw-complete/handlers/api/workspace"
 	"excalidraw-complete/stores"
 	"flag"
 	"fmt"
@@ -69,9 +70,53 @@ func handleUI() http.Handler {
 			http.Error(w, "Error reading file", http.StatusInternalServerError)
 			return
 		}
-		modifiedContent := strings.ReplaceAll(string(fileContent), "firestore.googleapis.com", "localhost:3002")
-		modifiedContent = strings.ReplaceAll(modifiedContent, "ssl=!0", "ssl=0")
-		modifiedContent = strings.ReplaceAll(modifiedContent, "ssl:!0", "ssl:0")
+		
+		// Get the hostname from the request (use X-Forwarded-Host if available for reverse proxy)
+		hostname := r.Header.Get("X-Forwarded-Host")
+		if hostname == "" {
+			hostname = r.Host
+		}
+		// Remove port if present (Kubernetes ingress handles port mapping)
+		if idx := strings.Index(hostname, ":"); idx != -1 {
+			hostname = hostname[:idx]
+		}
+		
+		// Determine if we're using HTTPS (check X-Forwarded-Proto for reverse proxy)
+		proto := r.Header.Get("X-Forwarded-Proto")
+		useSSL := proto == "https" || r.TLS != nil
+		
+		// Build the full URL with protocol
+		var fullURL string
+		if useSSL {
+			fullURL = "https://" + hostname
+		} else {
+			fullURL = "http://" + hostname
+		}
+		
+		// Replace firestore.googleapis.com with the actual domain from the request
+		// This allows the Firebase SDK to connect to our self-hosted server
+		modifiedContent := strings.ReplaceAll(string(fileContent), "firestore.googleapis.com", hostname)
+		
+		// Replace localhost:3002, oss-collab.excalidraw.com, and json.excalidraw.com with the actual domain
+		// This allows Socket.IO and API endpoints to connect to our self-hosted server
+		modifiedContent = strings.ReplaceAll(modifiedContent, "http://localhost:3002", fullURL)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "https://oss-collab.excalidraw.com", fullURL)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "https://json.excalidraw.com", fullURL)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "wss://oss-collab.excalidraw.com", "wss://"+hostname)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "json.excalidraw.com", hostname)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "oss-collab.excalidraw.com", hostname)
+		modifiedContent = strings.ReplaceAll(modifiedContent, "localhost:3002", hostname)
+		
+		// Enable or disable SSL based on the request protocol
+		if useSSL {
+			// Enable SSL (ssl=1, ssl:1)
+			modifiedContent = strings.ReplaceAll(modifiedContent, "ssl=!0", "ssl=1")
+			modifiedContent = strings.ReplaceAll(modifiedContent, "ssl:!0", "ssl:1")
+		} else {
+			// Disable SSL (ssl=0, ssl:0)
+			modifiedContent = strings.ReplaceAll(modifiedContent, "ssl=!0", "ssl=0")
+			modifiedContent = strings.ReplaceAll(modifiedContent, "ssl:!0", "ssl:0")
+		}
 
 		// Set the correct Content-Type based on the file extension
 		contentType := http.DetectContentType([]byte(modifiedContent))
@@ -103,7 +148,7 @@ func handleUI() http.Handler {
 	})
 }
 
-func setupRouter(documentStore core.DocumentStore) *chi.Mux {
+func setupRouter(documentStore core.DocumentStore, workspaceStore core.WorkspaceStore) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
@@ -126,6 +171,17 @@ func setupRouter(documentStore core.DocumentStore) *chi.Mux {
 			r.Get("/", documents.HandleGet(documentStore))
 		})
 	})
+
+	r.Route("/api/workspace/files", func(r chi.Router) {
+		r.Get("/", workspace.HandleList(workspaceStore))
+		r.Post("/", workspace.HandleCreate(workspaceStore))
+		r.Route("/{id}", func(r chi.Router) {
+			r.Get("/", workspace.HandleGet(workspaceStore))
+			r.Put("/", workspace.HandleUpdate(workspaceStore))
+			r.Delete("/", workspace.HandleDelete(workspaceStore))
+		})
+	})
+
 	return r
 }
 func setupSocketIO() *socketio.Server {
@@ -255,8 +311,9 @@ func main() {
 	}
 	logrus.SetLevel(level)
 
-	documentStore := stores.GetStore() // Make sure this is well-defined in your "stores" package
-	r := setupRouter(documentStore)
+	documentStore := stores.GetStore()
+	workspaceStore := stores.GetWorkspaceStore()
+	r := setupRouter(documentStore, workspaceStore)
 	ioo := setupSocketIO()
 	r.Handle("/socket.io/", ioo.ServeHandler(nil))
 	r.Get("/ping", func(w http.ResponseWriter, _ *http.Request) {
